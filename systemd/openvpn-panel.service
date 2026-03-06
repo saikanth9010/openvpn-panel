@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenVPN Web Panel
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/openvpn-panel/backend
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
