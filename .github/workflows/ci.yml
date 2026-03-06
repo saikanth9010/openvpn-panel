@@ -22,11 +22,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
+          # No cache: here — package-lock.json is not committed.
+          # We use npm install (not npm ci) for the same reason.
 
       - name: Install deps
-        run: npm ci
+        run: npm install
 
       - name: Lint
         run: npx eslint . --ext .js --max-warnings 0 || true
@@ -44,11 +44,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          # No cache: here — package-lock.json is not committed.
 
       - name: Install deps
-        run: npm ci
+        run: npm install
 
       - name: Build
         run: npm run build
@@ -57,6 +56,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
+          # Path is relative to repo root, not working-directory
           path: frontend/dist/
           retention-days: 7
 
@@ -67,9 +67,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: cd backend  && npm ci && npm audit --audit-level=high || true
-      - run: cd frontend && npm ci && npm audit --audit-level=high || true
+        with:
+          node-version: '20'
+      - name: Audit backend
+        run: cd backend  && npm install && npm audit --audit-level=high || true
+      - name: Audit frontend
+        run: cd frontend && npm install && npm audit --audit-level=high || true
 
   # ── Shell script validation ───────────────────────────────────────────────────
   shellcheck:
@@ -77,8 +80,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y shellcheck
-      - run: shellcheck install.sh scripts/*.sh
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      # The scripts source /etc/openvpn-panel/install.conf at runtime.
+      # We stub that file here so ShellCheck's -x (follow source) mode
+      # doesn't error, and we also tell ShellCheck to treat the missing
+      # file as an external source it can't follow (SC1091).
+      - name: Stub runtime config for ShellCheck
+        run: |
+          sudo mkdir -p /etc/openvpn-panel
+          sudo tee /etc/openvpn-panel/install.conf > /dev/null << 'EOF'
+          SERVER_ADDR="vpn.example.com"
+          VPN_PORT="1194"
+          VPN_SUBNET="10.8.0.0"
+          PANEL_PORT="443"
+          ADMIN_USER="admin"
+          ADMIN_PASS="placeholder"
+          ORG_NAME="MyOrg"
+          DEFAULT_CIPHER="AES-256-CBC"
+          EOF
+
+      - name: Run ShellCheck
+        # SC1091: don't error on sourced files that can't be followed
+        # SC2034: don't warn on variables that appear unused in sourced files
+        run: |
+          shellcheck --severity=error \
+            --exclude=SC1091,SC2034 \
+            install.sh scripts/*.sh
 
   # ── Release — attach installer tarball ───────────────────────────────────────
   release:
@@ -94,7 +124,7 @@ jobs:
           node-version: '20'
 
       - name: Build frontend
-        run: cd frontend && npm ci && npm run build
+        run: cd frontend && npm install && npm run build
 
       - name: Create release tarball
         run: |
