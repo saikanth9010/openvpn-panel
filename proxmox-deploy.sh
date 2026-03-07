@@ -448,8 +448,10 @@ if [[ "$DEPLOY_MODE" == "1" ]]; then
     --unprivileged 0 \
     --features  nesting=1 \
     --onboot    1
-  # Enable TUN device — required for OpenVPN (Proxmox 8 syntax)
-  pct set "${CT_ID}" --dev0 tun,mode=0666
+  # Enable TUN device for OpenVPN — write directly to container config
+  echo "lxc.cgroup2.devices.allow = c 10:200 rwm" >> /etc/pve/lxc/${CT_ID}.conf
+  echo "lxc.mount.entry = /dev/net/tun dev/net/tun none bind,create=file" >> /etc/pve/lxc/${CT_ID}.conf
+  log "TUN device configured for CT-${CT_ID}"
   pct start "${CT_ID}"
   log "CT-${CT_ID} created and started"
   wait_for_ct "${CT_ID}"
@@ -469,43 +471,46 @@ else
   # CT-A — VPN
   info "Creating CT-${CT_VPN_ID} (${CT_VPN_HOST}) — VPN server..."
   NET0_VPN=$(net_arg "${CT_VPN_IP}" "${CT_VPN_GW:-}")
-  NET1_VPN="name=eth1,bridge=${INT_BRIDGE},ip=${CT_VPN_INT_IP}/24"
 
   pct create "${CT_VPN_ID}" "${TMPL_PATH}" \
-    --hostname  "${CT_VPN_HOST}" \
-    --memory    "${CT_VPN_RAM}" \
-    --cores     1 \
-    --rootfs    "${CT_STORAGE}:${CT_VPN_DISK}" \
-    --net0      "${NET0_VPN}" \
-    --net1      "${NET1_VPN}" \
-    --password  "${CT_VPN_PASS}" \
+    --hostname    "${CT_VPN_HOST}" \
+    --memory      "${CT_VPN_RAM}" \
+    --cores       1 \
+    --rootfs      "${CT_STORAGE}:${CT_VPN_DISK}" \
+    --net0        "${NET0_VPN}" \
+    --net1        "name=eth1,bridge=${INT_BRIDGE}" \
+    --password    "${CT_VPN_PASS}" \
     --unprivileged 0 \
-    --features  nesting=1 \
-    --onboot    1
-  # Enable TUN device — required for OpenVPN (Proxmox 8 syntax)
-  pct set "${CT_VPN_ID}" --dev0 tun,mode=0666
+    --features    nesting=1 \
+    --onboot      1
+  # Enable TUN device for OpenVPN — write directly to container config
+  echo "lxc.cgroup2.devices.allow = c 10:200 rwm" >> /etc/pve/lxc/${CT_VPN_ID}.conf
+  echo "lxc.mount.entry = /dev/net/tun dev/net/tun none bind,create=file" >> /etc/pve/lxc/${CT_VPN_ID}.conf
+  log "TUN device configured for CT-${CT_VPN_ID}"
   pct start "${CT_VPN_ID}"
   log "CT-${CT_VPN_ID} created and started"
   wait_for_ct "${CT_VPN_ID}"
+  # Configure internal bridge IP inside container
+  ct_exec "${CT_VPN_ID}" "ip addr add ${CT_VPN_INT_IP}/24 dev eth1 2>/dev/null || true; ip link set eth1 up || true"
+  ct_exec "${CT_VPN_ID}" "echo 'auto eth1\niface eth1 inet static\n  address ${CT_VPN_INT_IP}/24' >> /etc/network/interfaces"
   ct_exec "${CT_VPN_ID}" "sysctl -w net.ipv4.ip_forward=1; \
     grep -q ip_forward /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf"
 
   # CT-B — Panel
   info "Creating CT-${CT_PANEL_ID} (${CT_PANEL_HOST}) — Web panel..."
   NET0_PANEL=$(net_arg "${CT_PANEL_IP}" "${CT_PANEL_GW:-}")
-  NET1_PANEL="name=eth1,bridge=${INT_BRIDGE},ip=${CT_PANEL_INT_IP}/24"
 
   pct create "${CT_PANEL_ID}" "${TMPL_PATH}" \
-    --hostname  "${CT_PANEL_HOST}" \
-    --memory    "${CT_PANEL_RAM}" \
-    --cores     2 \
-    --rootfs    "${CT_STORAGE}:${CT_PANEL_DISK}" \
-    --net0      "${NET0_PANEL}" \
-    --net1      "${NET1_PANEL}" \
-    --password  "${CT_PANEL_PASS}" \
+    --hostname    "${CT_PANEL_HOST}" \
+    --memory      "${CT_PANEL_RAM}" \
+    --cores       2 \
+    --rootfs      "${CT_STORAGE}:${CT_PANEL_DISK}" \
+    --net0        "${NET0_PANEL}" \
+    --net1        "name=eth1,bridge=${INT_BRIDGE}" \
+    --password    "${CT_PANEL_PASS}" \
     --unprivileged 1 \
-    --features  nesting=1 \
-    --onboot    1
+    --features    nesting=1 \
+    --onboot      1
   pct start "${CT_PANEL_ID}"
   log "CT-${CT_PANEL_ID} created and started"
   wait_for_ct "${CT_PANEL_ID}"
