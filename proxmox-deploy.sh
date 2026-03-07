@@ -446,8 +446,10 @@ if [[ "$DEPLOY_MODE" == "1" ]]; then
     --net0      "${NET0}" \
     --password  "${CT_ROOT_PASS}" \
     --unprivileged 0 \
-    --features  nesting=1,tun=1 \
+    --features  nesting=1 \
     --onboot    1
+  # Enable TUN device — required for OpenVPN (Proxmox 8 syntax)
+  pct set "${CT_ID}" --dev0 tun,mode=0666
   pct start "${CT_ID}"
   log "CT-${CT_ID} created and started"
   wait_for_ct "${CT_ID}"
@@ -478,8 +480,10 @@ else
     --net1      "${NET1_VPN}" \
     --password  "${CT_VPN_PASS}" \
     --unprivileged 0 \
-    --features  nesting=1,tun=1 \
+    --features  nesting=1 \
     --onboot    1
+  # Enable TUN device — required for OpenVPN (Proxmox 8 syntax)
+  pct set "${CT_VPN_ID}" --dev0 tun,mode=0666
   pct start "${CT_VPN_ID}"
   log "CT-${CT_VPN_ID} created and started"
   wait_for_ct "${CT_VPN_ID}"
