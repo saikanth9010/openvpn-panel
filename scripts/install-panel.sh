@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # scripts/install-panel.sh — Installs Node.js backend + React frontend + Nginx
-set -euo pipefail
+set -uo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 source /etc/openvpn-panel/install.conf
 
 DEV="${1:-false}"

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # scripts/install-vpn.sh — Installs and configures OpenVPN + Easy-RSA
-set -euo pipefail
+set -uo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 source /etc/openvpn-panel/install.conf
 
 log()  { echo -e "\033[0;32m[✔]\033[0m $*"; }

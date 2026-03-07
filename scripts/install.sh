@@ -1,240 +1,200 @@
 #!/usr/bin/env bash
-# ============================================================
-#  OpenVPN Web Panel — One-Command Installer
-#  Usage: curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/openvpn-panel/main/scripts/install.sh | bash
-#  Or:    git clone ... && bash scripts/install.sh
-# ============================================================
-set -euo pipefail
+# =============================================================================
+#  OpenVPN Panel — One-Command Installer
+#  Usage: curl -fsSL https://raw.githubusercontent.com/YOUR_USER/openvpn-panel/main/install.sh | bash
+#  Or:    bash install.sh [--vpn-only] [--panel-only] [--dev]
+# =============================================================================
+set -uo pipefail
 
-REPO="https://github.com/YOUR_USERNAME/openvpn-panel"
-INSTALL_DIR="/opt/openvpn-panel"
-NODE_VERSION="20"
-
-# ── Colors ──────────────────────────────────────────────────
+# ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-success() { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
-step()    { echo -e "\n${BOLD}${BLUE}━━━ $* ━━━${NC}"; }
+log()     { echo -e "${GREEN}[✔]${NC} $*"; }
+info()    { echo -e "${BLUE}[→]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
+error()   { echo -e "${RED}[✘]${NC} $*"; exit 1; }
+section() { echo -e "\n${BOLD}${CYAN}━━━ $* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"; }
 
-# ── Banner ───────────────────────────────────────────────────
-echo -e "${BOLD}"
+# ── Banner ────────────────────────────────────────────────────────────────────
+echo -e "${BOLD}${BLUE}"
 cat << 'BANNER'
-  ___                 __   _____  _   _   ____                  _
- / _ \ _ __   ___ _ _\ \ / / _ \| \ | | |  _ \ __ _ _ __   ___| |
-| | | | '_ \ / _ \ '_ \ V /| |_) |  \| | | |_) / _` | '_ \ / _ \ |
-| |_| | |_) |  __/ | | | | |  __/| |\  | |  __/ (_| | | | |  __/ |
- \___/| .__/ \___|_| |_|_| |_|   |_| \_| |_|   \__,_|_| |_|\___|_|
-      |_|         Proxmox LXC  •  TP-Link Compatible  •  RBAC
+  ___  ___  ___ _  ___   ___ _  _   ___  _   _  _ ___ _
+ / _ \| _ \| __| \| \ \ / / | \| | | _ \/_\ | \| | __| |
+| (_) |  _/ _|| .` |\ V /| | .` | |  _/ _ \| .` | _|| |__
+ \___/|_| |___|_|\_| \_/ |_|_|\_| |_|/_/ \_\_|\_|___|____|
+
+  Proxmox LXC · TP-Link Compatible · RBAC Web UI
 BANNER
 echo -e "${NC}"
 
-# ── Preflight checks ─────────────────────────────────────────
-step "Preflight Checks"
+# ── Parse args ────────────────────────────────────────────────────────────────
+MODE="full"
+DEV=false
+for arg in "$@"; do
+  case $arg in
+    --vpn-only)   MODE="vpn" ;;
+    --panel-only) MODE="panel" ;;
+    --dev)        DEV=true ;;
+    --help|-h)
+      echo "Usage: $0 [--vpn-only] [--panel-only] [--dev]"
+      echo "  --vpn-only    Install OpenVPN server only (CT-100)"
+      echo "  --panel-only  Install web panel only     (CT-101)"
+      echo "  --dev         Skip SSL, use HTTP on port 3000"
+      exit 0 ;;
+  esac
+done
 
-[[ $EUID -ne 0 ]] && error "Run as root: sudo bash install.sh"
+# ── Detect environment ────────────────────────────────────────────────────────
+section "Environment Detection"
 
 OS=$(. /etc/os-release && echo "$ID")
 VER=$(. /etc/os-release && echo "$VERSION_ID")
-info "Detected OS: $OS $VER"
-[[ "$OS" != "ubuntu" && "$OS" != "debian" ]] && warn "Tested on Ubuntu/Debian. Proceeding anyway."
+ARCH=$(uname -m)
+IS_LXC=false
+[ -f /proc/1/environ ] && grep -q container=lxc /proc/1/environ 2>/dev/null && IS_LXC=true
 
-# Check if running inside LXC
-if systemd-detect-virt --container > /dev/null 2>&1; then
-    success "Running inside LXC container"
+info "OS: ${OS} ${VER} (${ARCH})"
+info "Mode: ${MODE}"
+info "LXC container: ${IS_LXC}"
+info "Dev mode: ${DEV}"
+
+[[ "$OS" != "ubuntu" && "$OS" != "debian" ]] && error "Unsupported OS. Ubuntu/Debian required."
+[[ $(id -u) -ne 0 ]] && error "Run as root: sudo bash install.sh"
+
+# ── Load / create config ──────────────────────────────────────────────────────
+section "Configuration"
+
+CONFIG_FILE="/etc/openvpn-panel/install.conf"
+mkdir -p /etc/openvpn-panel
+
+if [ -f "$CONFIG_FILE" ]; then
+  info "Loading existing config from $CONFIG_FILE"
+  source "$CONFIG_FILE"
 else
-    warn "Not detected as LXC. This installer is designed for Proxmox LXC."
+  info "No config found — running interactive setup"
+  echo ""
+
+  read -rp "  Server public IP or domain [auto-detect]: " SERVER_ADDR
+  if [ -z "$SERVER_ADDR" ]; then
+    SERVER_ADDR=$(curl -sf https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+    info "Auto-detected: $SERVER_ADDR"
+  fi
+
+  read -rp "  OpenVPN port [1194]: " VPN_PORT
+  VPN_PORT=${VPN_PORT:-1194}
+
+  read -rp "  VPN subnet [10.8.0.0]: " VPN_SUBNET
+  VPN_SUBNET=${VPN_SUBNET:-10.8.0.0}
+
+  read -rp "  Web panel port [443]: " PANEL_PORT
+  PANEL_PORT=${PANEL_PORT:-443}
+
+  read -rp "  Admin username [admin]: " ADMIN_USER
+  ADMIN_USER=${ADMIN_USER:-admin}
+
+  read -rsp "  Admin password: " ADMIN_PASS
+  echo ""
+  [ -z "$ADMIN_PASS" ] && error "Admin password cannot be empty"
+
+  read -rp "  Organisation name [MyOrg]: " ORG_NAME
+  ORG_NAME=${ORG_NAME:-MyOrg}
+
+  read -rp "  Default cipher [AES-256-CBC]: " DEFAULT_CIPHER
+  DEFAULT_CIPHER=${DEFAULT_CIPHER:-AES-256-CBC}
+
+  # Save config
+  cat > "$CONFIG_FILE" << CONF
+SERVER_ADDR="${SERVER_ADDR}"
+VPN_PORT="${VPN_PORT}"
+VPN_SUBNET="${VPN_SUBNET}"
+PANEL_PORT="${PANEL_PORT}"
+ADMIN_USER="${ADMIN_USER}"
+ADMIN_PASS="${ADMIN_PASS}"
+ORG_NAME="${ORG_NAME}"
+DEFAULT_CIPHER="${DEFAULT_CIPHER}"
+INSTALL_DATE="$(date -Iseconds)"
+CONF
+  chmod 600 "$CONFIG_FILE"
+  log "Config saved to $CONFIG_FILE"
 fi
 
-# ── System update ─────────────────────────────────────────────
-step "System Update"
+# ── System update ─────────────────────────────────────────────────────────────
+section "System Update"
+export DEBIAN_FRONTEND=noninteractive
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+
+# Fix locale warnings that appear in LXC containers
+locale-gen en_US.UTF-8 2>/dev/null || true
+update-locale LANG=en_US.UTF-8 2>/dev/null || true
+
+# Fix any broken packages before doing anything else
+dpkg --configure -a 2>/dev/null || true
+apt-get -f install -y 2>/dev/null || true
+
 apt-get update -qq
-apt-get install -y -qq curl git wget gnupg2 lsb-release ca-certificates \
-    nginx openssl ufw fail2ban tcpdump net-tools
-success "System packages installed"
 
-# ── Node.js ──────────────────────────────────────────────────
-step "Node.js $NODE_VERSION"
-if command -v node &>/dev/null && node --version | grep -q "^v${NODE_VERSION}"; then
-    success "Node.js $(node --version) already installed"
-else
-    info "Installing Node.js $NODE_VERSION..."
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - > /dev/null 2>&1
-    apt-get install -y -qq nodejs
-    success "Node.js $(node --version) installed"
+# Use dist-upgrade instead of upgrade — resolves held/broken packages
+# --fix-broken ensures dependency issues are resolved before proceeding
+apt-get dist-upgrade -y \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold" \
+  --fix-broken 2>&1 | grep -v "^$\|^(Reading\|Selecting\|Preparing\|Unpacking\|Setting\|Processing\|locale:" || true
+
+apt-get install -y \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold" \
+  curl wget git jq openssl \
+  iptables iptables-persistent \
+  net-tools iproute2 \
+  tcpdump \
+  fail2ban \
+  ufw 2>&1 | grep -v "^locale:\|apparmor_parser" || true
+
+log "System packages installed"
+
+# ── Install OpenVPN ───────────────────────────────────────────────────────────
+if [[ "$MODE" == "full" || "$MODE" == "vpn" ]]; then
+  section "Installing OpenVPN"
+  bash "$(dirname "$0")/scripts/install-vpn.sh"
+  log "OpenVPN installed"
 fi
 
-# ── Clone / update repo ───────────────────────────────────────
-step "Installing OpenVPN Panel"
-if [[ -d "$INSTALL_DIR/.git" ]]; then
-    info "Existing install found — pulling latest..."
-    cd "$INSTALL_DIR" && git pull
-else
-    # If running from a pipe (curl | bash), clone from GitHub
-    if [[ ! -d "$(dirname "$0")/../frontend" ]]; then
-        info "Cloning from $REPO..."
-        git clone "$REPO" "$INSTALL_DIR"
-    else
-        # Running from a local clone
-        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        LOCAL_REPO="$(dirname "$SCRIPT_DIR")"
-        info "Copying from local repo: $LOCAL_REPO"
-        cp -r "$LOCAL_REPO" "$INSTALL_DIR"
-    fi
-fi
-cd "$INSTALL_DIR"
-success "Files ready at $INSTALL_DIR"
-
-# ── Backend dependencies ──────────────────────────────────────
-step "Backend Dependencies"
-cd "$INSTALL_DIR/backend"
-npm install --production --silent
-success "Backend packages installed"
-
-# ── Frontend build ────────────────────────────────────────────
-step "Frontend Build"
-cd "$INSTALL_DIR/frontend"
-npm install --silent
-npm run build
-success "React app built to frontend/dist/"
-
-# ── Environment config ────────────────────────────────────────
-step "Environment Configuration"
-ENV_FILE="$INSTALL_DIR/backend/.env"
-if [[ ! -f "$ENV_FILE" ]]; then
-    cp "$INSTALL_DIR/backend/.env.example" "$ENV_FILE"
-    # Generate a secure JWT secret automatically
-    JWT_SECRET=$(openssl rand -hex 32)
-    sed -i "s/CHANGE_THIS_TO_A_RANDOM_64_CHAR_STRING/$JWT_SECRET/" "$ENV_FILE"
-    success "Generated .env with secure JWT secret"
-else
-    warn ".env already exists — skipping (not overwriting your config)"
+# ── Install Web Panel ─────────────────────────────────────────────────────────
+if [[ "$MODE" == "full" || "$MODE" == "panel" ]]; then
+  section "Installing Web Panel"
+  bash "$(dirname "$0")/scripts/install-panel.sh" "$DEV"
+  log "Web panel installed"
 fi
 
-# Prompt for VPN host
-echo ""
-echo -e "${BOLD}Configure VPN Container Connection${NC}"
-read -p "  OpenVPN container IP [10.10.0.1]: " VPN_IP
-VPN_IP="${VPN_IP:-10.10.0.1}"
-sed -i "s/VPN_HOST=.*/VPN_HOST=$VPN_IP/" "$ENV_FILE"
+# ── Firewall ──────────────────────────────────────────────────────────────────
+section "Configuring Firewall"
+bash "$(dirname "$0")/scripts/setup-firewall.sh"
+log "Firewall configured"
 
-read -p "  Your server's public IP or domain (for OVPN files) [auto-detect]: " PUB_IP
-if [[ -z "$PUB_IP" ]]; then
-    PUB_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "YOUR_SERVER_IP")
-fi
-echo "VPN_PUBLIC_IP=$PUB_IP" >> "$ENV_FILE"
-success "Environment configured (VPN host: $VPN_IP, Public IP: $PUB_IP)"
+# ── Fail2Ban ──────────────────────────────────────────────────────────────────
+section "Configuring Fail2Ban"
+bash "$(dirname "$0")/scripts/setup-fail2ban.sh"
+log "Fail2Ban configured"
 
-# ── TLS certificate ───────────────────────────────────────────
-step "TLS Certificate"
-SSL_DIR="/etc/ssl/openvpn-panel"
-mkdir -p "$SSL_DIR"
+# ── Done ─────────────────────────────────────────────────────────────────────
+section "Installation Complete"
 
-if [[ ! -f "$SSL_DIR/cert.pem" ]]; then
-    info "Generating self-signed TLS certificate..."
-    LOCAL_IP=$(hostname -I | awk '{print $1}')
-    openssl req -x509 -nodes -days 825 \
-        -newkey rsa:4096 \
-        -keyout "$SSL_DIR/key.pem" \
-        -out "$SSL_DIR/cert.pem" \
-        -subj "/CN=openvpn-panel/O=Internal/C=US" \
-        -addext "subjectAltName=IP:${LOCAL_IP},IP:127.0.0.1" \
-        2>/dev/null
-    chmod 600 "$SSL_DIR/key.pem"
-    success "Self-signed certificate created (IP: $LOCAL_IP)"
-    warn "For production, replace with a real cert from Let's Encrypt"
-else
-    success "TLS certificate already exists"
-fi
+PANEL_URL="https://${SERVER_ADDR}"
+[ "$DEV" = true ] && PANEL_URL="http://${SERVER_ADDR}:3000"
 
-# ── Nginx ─────────────────────────────────────────────────────
-step "Nginx Configuration"
-cp "$INSTALL_DIR/nginx/openvpn-panel.conf" /etc/nginx/sites-available/openvpn-panel
-ln -sf /etc/nginx/sites-available/openvpn-panel /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
-
-nginx -t 2>/dev/null && success "Nginx config valid" || error "Nginx config test failed"
-systemctl enable nginx --quiet
-systemctl restart nginx
-success "Nginx running"
-
-# ── systemd service ───────────────────────────────────────────
-step "Systemd Service"
-cp "$INSTALL_DIR/systemd/openvpn-panel.service" /etc/systemd/system/
-# Fix paths in service file
-sed -i "s|/opt/openvpn-panel|$INSTALL_DIR|g" /etc/systemd/system/openvpn-panel.service
-systemctl daemon-reload
-systemctl enable openvpn-panel --quiet
-systemctl restart openvpn-panel
-sleep 2
-if systemctl is-active --quiet openvpn-panel; then
-    success "OpenVPN Panel service running"
-else
-    warn "Service may have issues. Check: journalctl -u openvpn-panel -n 30"
-fi
-
-# ── Fail2Ban ──────────────────────────────────────────────────
-step "Fail2Ban Setup"
-cat > /etc/fail2ban/jail.d/openvpn-panel.conf << 'EOF'
-[sshd]
-enabled = true
-maxretry = 3
-bantime  = 86400
-findtime = 600
-EOF
-systemctl enable fail2ban --quiet
-systemctl restart fail2ban
-success "Fail2Ban configured"
-
-# ── SSH key for VPN container ────────────────────────────────
-step "SSH Key for VPN Container"
-SSH_KEY="/root/.ssh/vpn_key"
-if [[ ! -f "$SSH_KEY" ]]; then
-    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -q
-    success "SSH key generated: $SSH_KEY"
-else
-    success "SSH key already exists: $SSH_KEY"
-fi
-
-# ── Firewall ──────────────────────────────────────────────────
-step "Firewall (UFW)"
-ufw --force reset > /dev/null 2>&1
-ufw default deny incoming > /dev/null 2>&1
-ufw default allow outgoing > /dev/null 2>&1
-ufw allow 22/tcp   > /dev/null 2>&1
-ufw allow 443/tcp  > /dev/null 2>&1
-ufw allow 80/tcp   > /dev/null 2>&1
-ufw --force enable > /dev/null 2>&1
-success "Firewall enabled (22, 80, 443 open)"
-
-# ── Done ─────────────────────────────────────────────────────
-LOCAL_IP=$(hostname -I | awk '{print $1}')
-echo ""
 echo -e "${GREEN}${BOLD}"
-echo "  ╔════════════════════════════════════════════════════╗"
-echo "  ║         ✓  Installation Complete!                  ║"
-echo "  ╚════════════════════════════════════════════════════╝"
+echo "  ╔══════════════════════════════════════════════╗"
+echo "  ║        OpenVPN Panel is ready! 🎉            ║"
+echo "  ╠══════════════════════════════════════════════╣"
+echo "  ║  Panel URL : ${PANEL_URL}"
+echo "  ║  Admin     : ${ADMIN_USER}"
+echo "  ║  VPN Port  : ${VPN_PORT}/UDP"
+echo "  ║  Subnet    : ${VPN_SUBNET}/24"
+echo "  ╠══════════════════════════════════════════════╣"
+echo "  ║  Logs      : journalctl -u openvpn-panel -f  ║"
+echo "  ║  VPN logs  : /var/log/openvpn/openvpn.log    ║"
+echo "  ║  Config    : /etc/openvpn-panel/install.conf ║"
+echo "  ╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
-echo -e "  ${BOLD}Web Panel:${NC}  https://${LOCAL_IP}"
-echo -e "  ${BOLD}API:${NC}        https://${LOCAL_IP}/api"
-echo ""
-echo -e "  ${BOLD}Default login:${NC}"
-echo -e "    admin  / admin123   (${RED}change immediately!${NC})"
-echo -e "    ops    / ops123"
-echo -e "    viewer / view123"
-echo ""
-echo -e "  ${BOLD}Next steps:${NC}"
-echo -e "  1. Copy SSH key to VPN container (CT-100):"
-echo -e "     ${YELLOW}ssh-copy-id -i $SSH_KEY root@${VPN_IP}${NC}"
-echo ""
-echo -e "  2. Change default passwords in the Admin panel"
-echo ""
-echo -e "  3. Check service status:"
-echo -e "     ${YELLOW}systemctl status openvpn-panel${NC}"
-echo -e "     ${YELLOW}journalctl -u openvpn-panel -f${NC}"
-echo ""
-echo -e "  ${BOLD}Logs:${NC} journalctl -u openvpn-panel"
-echo ""
