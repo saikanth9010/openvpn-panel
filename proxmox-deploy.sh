@@ -71,45 +71,51 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 section "Proxmox Storage"
 
-# List available storages
+# List available storages — try pvesm first (more reliable than pvesh)
 info "Available storages:"
-pvesh get /nodes/$(hostname)/storage --output-format=text 2>/dev/null \
-  | awk '/storage:/{print "    · "$2}' || pvesm status | awk 'NR>1{print "    · "$1}'
+pvesm status 2>/dev/null | awk 'NR>1{printf "    · %-20s %s\n", $1, $2}' \
+  || echo "    (could not list storages)"
 
 echo ""
 read -rp "  Storage for container rootfs [local-lvm]: " CT_STORAGE
 CT_STORAGE=${CT_STORAGE:-local-lvm}
 
-read -rp "  Storage for CT template     [local]: " TMPL_STORAGE
+read -rp "  Storage for CT template      [local]: " TMPL_STORAGE
 TMPL_STORAGE=${TMPL_STORAGE:-local}
+
+log "Rootfs storage: $CT_STORAGE"
+log "Template storage: $TMPL_STORAGE"
+
+# ── next_free_ctid must be defined before first use ──────────────────────────
+next_free_ctid() {
+  local id=${1:-100}
+  while pct status "$id" &>/dev/null 2>&1; do id=$((id+1)); done
+  echo "$id"
+}
 
 # Find or download Ubuntu 24.04 template
 section "Ubuntu 24.04 LXC Template"
 TMPL_NAME="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
-TMPL_PATH="${TMPL_STORAGE}:vztmpl/${TMPL_NAME}"
 
-if pveam list "$TMPL_STORAGE" 2>/dev/null | grep -q "ubuntu-24.04"; then
-  log "Template already downloaded"
-  TMPL_PATH=$(pveam list "$TMPL_STORAGE" | grep "ubuntu-24.04" | awk '{print $1}' | head -1)
-  info "Using: $TMPL_PATH"
+# Check if template is already present on the storage
+EXISTING_TMPL=$(pveam list "$TMPL_STORAGE" 2>/dev/null | grep "ubuntu-24.04" | awk '{print $1}' | head -1)
+
+if [[ -n "$EXISTING_TMPL" ]]; then
+  TMPL_PATH="$EXISTING_TMPL"
+  log "Template already present: $TMPL_PATH"
 else
-  info "Downloading Ubuntu 24.04 template..."
-  pveam update
-  pveam download "$TMPL_STORAGE" "$TMPL_NAME"
-  log "Template downloaded"
+  info "Template not found — downloading..."
+  pveam update 2>&1 | tail -1
+  pveam download "$TMPL_STORAGE" "$TMPL_NAME" \
+    || error "Template download failed. Check storage '$TMPL_STORAGE' has enough space and is writable."
+  TMPL_PATH="${TMPL_STORAGE}:vztmpl/${TMPL_NAME}"
+  log "Template downloaded: $TMPL_PATH"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SECTION 3 — CONTAINER IDs & NETWORKING
 # ─────────────────────────────────────────────────────────────────────────────
 section "Container Configuration"
-
-# Find next free CTID
-next_free_ctid() {
-  local id=${1:-100}
-  while pct status "$id" &>/dev/null 2>&1; do id=$((id+1)); done
-  echo "$id"
-}
 
 if [[ "$DEPLOY_MODE" == "1" ]]; then
   # ── Single container ────────────────────────────────────────────────────────
