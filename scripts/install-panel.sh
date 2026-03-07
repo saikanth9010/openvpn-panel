@@ -1,58 +1,58 @@
 #!/usr/bin/env bash
 # scripts/install-panel.sh — Installs Node.js backend + React frontend + Nginx
 set -uo pipefail
-export DEBIAN_FRONTEND=noninteractive
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
+export DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
 source /etc/openvpn-panel/install.conf
 
-DEV="${1:-false}"
 PANEL_DIR=/opt/openvpn-panel
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 log()  { echo -e "\033[0;32m[✔]\033[0m $*"; }
 info() { echo -e "\033[0;34m[→]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
+error(){ echo -e "\033[0;31m[✘]\033[0m $*"; exit 1; }
 
-# ── Node.js ───────────────────────────────────────────────────────────────────
-if ! command -v node &>/dev/null; then
-  info "Installing Node.js 20 LTS..."
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - -qq
-  apt-get install -y -qq nodejs
+# ── Node.js 20 ────────────────────────────────────────────────────────────────
+if ! node --version 2>/dev/null | grep -q "v20"; then
+  info "Installing Node.js 20..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>&1 | tail -3
+  apt-get install -y nodejs 2>&1 | grep -E "^(Setting up|nodejs)" || true
 fi
-NODE_VER=$(node --version)
-log "Node.js $NODE_VER ready"
+log "Node $(node --version)  npm $(npm --version)"
 
 # ── Nginx ─────────────────────────────────────────────────────────────────────
-apt-get install -y -qq nginx
-log "Nginx installed"
+apt-get install -y nginx 2>&1 | grep -E "^(Setting up|nginx)" || true
+log "Nginx ready"
 
 # ── Copy project files ────────────────────────────────────────────────────────
-info "Copying project to $PANEL_DIR..."
-mkdir -p "$PANEL_DIR"
-cp -r "$REPO_DIR/backend/."  "$PANEL_DIR/"
+info "Setting up $PANEL_DIR..."
+mkdir -p "$PANEL_DIR/data"
+cp "$REPO_DIR/backend/server.js"    "$PANEL_DIR/server.js"
+cp "$REPO_DIR/backend/package.json" "$PANEL_DIR/package.json"
+mkdir -p "$PANEL_DIR/frontend"
 cp -r "$REPO_DIR/frontend/." "$PANEL_DIR/frontend/"
 log "Files copied"
 
 # ── Backend dependencies ──────────────────────────────────────────────────────
-info "Installing backend dependencies..."
+info "Installing backend npm packages..."
 cd "$PANEL_DIR"
-npm install --omit=dev --silent
-log "Backend deps installed"
+npm install 2>&1 | tail -3
+[[ -d "$PANEL_DIR/node_modules/express" ]] || error "npm install failed"
+log "Backend packages installed"
 
 # ── Frontend build ────────────────────────────────────────────────────────────
 info "Building React frontend..."
 cd "$PANEL_DIR/frontend"
-npm install --silent
-npm run build
-log "Frontend built → $PANEL_DIR/frontend/dist"
+npm install 2>&1 | tail -3
+npm run build 2>&1 | tail -5
+[[ -d "$PANEL_DIR/frontend/dist" ]] || error "Frontend build failed — dist missing"
+log "Frontend built: $PANEL_DIR/frontend/dist"
 
-# ── Write runtime config ──────────────────────────────────────────────────────
-info "Writing runtime environment..."
-HASHED_PASS=$(node -e "const b=require('bcryptjs');console.log(b.hashSync('${ADMIN_PASS}',10))")
-
+# ── Runtime env ───────────────────────────────────────────────────────────────
+info "Writing /etc/openvpn-panel/env..."
 JWT_SECRET=$(openssl rand -hex 32)
 SESSION_SECRET=$(openssl rand -hex 32)
+VPN_CONTAINER_IP="${VPN_CONTAINER_IP:-10.10.0.1}"
 
 mkdir -p /etc/openvpn-panel
 cat > /etc/openvpn-panel/env << ENV
@@ -60,11 +60,13 @@ NODE_ENV=production
 PORT=3001
 JWT_SECRET=${JWT_SECRET}
 SESSION_SECRET=${SESSION_SECRET}
+VPN_HOST=${VPN_CONTAINER_IP}
+VPN_SSH_USER=root
+VPN_SSH_KEY=/root/.ssh/vpn_key
 VPN_STATUS_LOG=/var/log/openvpn/status.log
 VPN_LOG=/var/log/openvpn/openvpn.log
-EASYRSA_DIR=/etc/openvpn/easy-rsa
-TA_KEY=/etc/openvpn/ta.key
-CA_CRT_PATH=/etc/openvpn/easy-rsa/pki/ca.crt
+VPN_EASY_RSA=/etc/openvpn/easy-rsa
+VPN_PUBLIC_IP=${SERVER_ADDR}
 SERVER_ADDR=${SERVER_ADDR}
 VPN_PORT=${VPN_PORT}
 VPN_SUBNET=${VPN_SUBNET}
@@ -73,137 +75,120 @@ ENV
 chmod 600 /etc/openvpn-panel/env
 log "Runtime env written"
 
-# ── Seed admin user ───────────────────────────────────────────────────────────
-cat > /etc/openvpn-panel/users.json << USERS
-[
-  {
-    "id": 1,
-    "username": "${ADMIN_USER}",
-    "password": "${HASHED_PASS}",
-    "name": "Administrator",
-    "role": "admin",
-    "status": "active",
-    "created": "$(date -Iseconds)"
-  }
-]
-USERS
-chmod 600 /etc/openvpn-panel/users.json
-log "Admin user created: ${ADMIN_USER}"
+# ── Seed admin user (uses passwordHash to match server.js) ───────────────────
+info "Seeding admin user..."
+cd "$PANEL_DIR"
+node -e "
+const bcrypt = require('bcryptjs');
+const {v4:uuidv4} = require('uuid');
+const fs = require('fs');
+const user = {
+  id: uuidv4(),
+  username: '${ADMIN_USER}',
+  passwordHash: bcrypt.hashSync('${ADMIN_PASS}', 10),
+  name: 'Administrator',
+  role: 'admin',
+  status: 'active',
+  createdAt: new Date().toISOString()
+};
+fs.writeFileSync('${PANEL_DIR}/data/users.json', JSON.stringify([user],null,2));
+console.log('Seeded:', user.username);
+"
+chmod 600 "$PANEL_DIR/data/users.json"
+log "Admin user seeded: ${ADMIN_USER}"
 
-# ── SSL Certificate ───────────────────────────────────────────────────────────
-if [ "$DEV" != "true" ]; then
+# ── SSL cert ──────────────────────────────────────────────────────────────────
+SSL_CERT="/etc/ssl/openvpn-panel/cert.pem"
+SSL_KEY="/etc/ssl/openvpn-panel/key.pem"
+
+if [[ ! -f "$SSL_CERT" ]]; then
   mkdir -p /etc/ssl/openvpn-panel
-  if command -v certbot &>/dev/null 2>&1; then
-    # Try Let's Encrypt if domain (not IP)
-    if [[ "$SERVER_ADDR" =~ ^[a-zA-Z] ]]; then
-      info "Attempting Let's Encrypt for $SERVER_ADDR..."
-      certbot certonly --standalone --non-interactive --agree-tos \
-        --email "admin@${SERVER_ADDR}" -d "$SERVER_ADDR" \
-        --pre-hook "systemctl stop nginx" \
-        --post-hook "systemctl start nginx" 2>/dev/null \
-        && SSL_CERT="/etc/letsencrypt/live/${SERVER_ADDR}/fullchain.pem" \
-        && SSL_KEY="/etc/letsencrypt/live/${SERVER_ADDR}/privkey.pem" \
-        || warn "Let's Encrypt failed — falling back to self-signed"
-    fi
+  # Try Let's Encrypt if SERVER_ADDR looks like a domain
+  if [[ "$SERVER_ADDR" =~ ^[a-zA-Z][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    info "Trying Let's Encrypt for $SERVER_ADDR..."
+    apt-get install -y certbot 2>/dev/null | grep "Setting up" || true
+    systemctl stop nginx 2>/dev/null || true
+    certbot certonly --standalone --non-interactive --agree-tos \
+      --email "admin@${SERVER_ADDR}" -d "$SERVER_ADDR" 2>/dev/null \
+      && SSL_CERT="/etc/letsencrypt/live/${SERVER_ADDR}/fullchain.pem" \
+      && SSL_KEY="/etc/letsencrypt/live/${SERVER_ADDR}/privkey.pem" \
+      && log "Let's Encrypt cert obtained" \
+      || warn "Let's Encrypt failed — using self-signed"
+    systemctl start nginx 2>/dev/null || true
   fi
   # Self-signed fallback
-  if [ ! -f "/etc/ssl/openvpn-panel/cert.pem" ] && [ -z "${SSL_CERT:-}" ]; then
-    info "Generating self-signed certificate..."
-    openssl req -x509 -nodes -days 825 \
-      -newkey rsa:4096 \
-      -keyout /etc/ssl/openvpn-panel/key.pem \
-      -out    /etc/ssl/openvpn-panel/cert.pem \
+  if [[ ! -f "$SSL_CERT" ]]; then
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+      -keyout "$SSL_KEY" -out "$SSL_CERT" \
       -subj "/CN=${SERVER_ADDR}/O=${ORG_NAME}/C=US" 2>/dev/null
-    SSL_CERT="/etc/ssl/openvpn-panel/cert.pem"
-    SSL_KEY="/etc/ssl/openvpn-panel/key.pem"
     log "Self-signed cert generated"
   fi
+fi
 
-  # ── Nginx HTTPS config ────────────────────────────────────────────────────
-  cat > /etc/nginx/sites-available/openvpn-panel << NGINX
+# ── Nginx config ──────────────────────────────────────────────────────────────
+info "Writing nginx config..."
+cat > /etc/nginx/sites-available/openvpn-panel << NGINX
 server {
     listen 80;
-    server_name ${SERVER_ADDR};
     return 301 https://\$host\$request_uri;
 }
 
 server {
     listen ${PANEL_PORT} ssl http2;
-    server_name ${SERVER_ADDR};
 
     ssl_certificate     ${SSL_CERT};
     ssl_certificate_key ${SSL_KEY};
     ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-    ssl_session_cache   shared:SSL:10m;
-    ssl_session_timeout 10m;
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
 
-    # React SPA
+    # Serve React SPA
+    root /opt/openvpn-panel/frontend/dist;
+    index index.html;
+
     location / {
-        root ${PANEL_DIR}/frontend/dist;
-        try_files \$uri /index.html;
-        expires 1h;
+        try_files \$uri \$uri/ /index.html;
     }
 
-    # API proxy
+    # API
     location /api/ {
         proxy_pass         http://127.0.0.1:3001;
         proxy_http_version 1.1;
         proxy_set_header   Host \$host;
         proxy_set_header   X-Real-IP \$remote_addr;
-        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 60s;
+        proxy_read_timeout 120s;
     }
 
-    # WebSocket (tcpdump stream)
+    # WebSocket
     location /ws/ {
-        proxy_pass         http://127.0.0.1:3001;
-        proxy_http_version 1.1;
-        proxy_set_header   Upgrade \$http_upgrade;
-        proxy_set_header   Connection "upgrade";
-        proxy_set_header   Host \$host;
-        proxy_read_timeout 3600s;
+        proxy_pass             http://127.0.0.1:3001;
+        proxy_http_version     1.1;
+        proxy_set_header       Upgrade \$http_upgrade;
+        proxy_set_header       Connection "upgrade";
+        proxy_set_header       Host \$host;
+        proxy_read_timeout     3600s;
     }
 }
 NGINX
-else
-  # Dev: plain HTTP proxy
-  cat > /etc/nginx/sites-available/openvpn-panel << NGINX
-server {
-    listen 3000;
-    location / { root ${PANEL_DIR}/frontend/dist; try_files \$uri /index.html; }
-    location /api/ { proxy_pass http://127.0.0.1:3001; proxy_http_version 1.1; }
-    location /ws/  { proxy_pass http://127.0.0.1:3001; proxy_http_version 1.1;
-                     proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; }
-}
-NGINX
-fi
 
 ln -sf /etc/nginx/sites-available/openvpn-panel /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
-nginx -t
+nginx -t || error "Nginx config test failed"
 systemctl enable nginx
-systemctl reload nginx
-log "Nginx configured"
+systemctl restart nginx
+log "Nginx configured and running"
 
 # ── Systemd service ───────────────────────────────────────────────────────────
 cat > /etc/systemd/system/openvpn-panel.service << SERVICE
 [Unit]
 Description=OpenVPN Web Panel
-Documentation=https://github.com/YOUR_USER/openvpn-panel
-After=network.target openvpn@server.service
-Wants=openvpn@server.service
+After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=${PANEL_DIR}
+WorkingDirectory=/opt/openvpn-panel
 EnvironmentFile=/etc/openvpn-panel/env
-ExecStart=/usr/bin/node server.js
+ExecStart=/usr/bin/node /opt/openvpn-panel/server.js
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -217,7 +202,7 @@ SERVICE
 systemctl daemon-reload
 systemctl enable openvpn-panel
 systemctl restart openvpn-panel
-sleep 2
+sleep 3
 systemctl is-active openvpn-panel \
-  && log "Web panel service is running on :3001" \
-  || (journalctl -u openvpn-panel -n 30 --no-pager; exit 1)
+  && log "Panel service running on :3001" \
+  || { journalctl -u openvpn-panel -n 20 --no-pager; error "Panel service failed to start"; }
