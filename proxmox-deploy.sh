@@ -164,15 +164,19 @@ next_free_ctid() {
 section "Ubuntu 24.04 LXC Template"
 TMPL_NAME="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
 
+# grep exits 1 when nothing matches — that would kill the script under set -e
+# so we use grep || true to safely get an empty string instead
 EXISTING_TMPL=$(pveam list "$TMPL_STORAGE" 2>/dev/null \
-  | grep "ubuntu-24.04" | awk '{print $1}' | head -1)
+  | grep "ubuntu-24.04" || true)
+EXISTING_TMPL=$(echo "$EXISTING_TMPL" | awk '{print $1}' | head -1)
 
 if [[ -n "$EXISTING_TMPL" ]]; then
   TMPL_PATH="$EXISTING_TMPL"
   log "Template already present: $TMPL_PATH"
 else
-  info "Template not found — downloading (this may take a minute)..."
-  pveam update 2>&1 | tail -1
+  info "Template not found — updating catalogue and downloading..."
+  info "(This can take 1-2 minutes depending on your connection)"
+  pveam update
   pveam download "$TMPL_STORAGE" "$TMPL_NAME" \
     || error "Download failed. Check '$TMPL_STORAGE' has space and is writable."
   TMPL_PATH="${TMPL_STORAGE}:vztmpl/${TMPL_NAME}"
@@ -188,7 +192,9 @@ if [[ "$DEPLOY_MODE" == "1" ]]; then
 
   DEF_CT=$(next_free_ctid 100)
   ask "Container ID"       CT_ID       "$DEF_CT"
-  pct status "$CT_ID" &>/dev/null 2>&1 && error "Container $CT_ID already exists — choose another ID"
+  if pct status "$CT_ID" &>/dev/null 2>&1; then
+    error "Container $CT_ID already exists — choose another ID"
+  fi
 
   ask "Container hostname" CT_HOSTNAME "openvpn-panel"
   ask "Disk size (GB)"     CT_DISK     "8"
@@ -212,7 +218,9 @@ else
   echo -e "\n  ${BOLD}Container A — OpenVPN Server${NC}"
   DEF_CTA=$(next_free_ctid 100)
   ask "Container ID"       CT_VPN_ID   "$DEF_CTA"
-  pct status "$CT_VPN_ID" &>/dev/null 2>&1 && error "Container $CT_VPN_ID already exists"
+  if pct status "$CT_VPN_ID" &>/dev/null 2>&1; then
+    error "Container $CT_VPN_ID already exists"
+  fi
   ask "Hostname"           CT_VPN_HOST "openvpn-server"
   ask "Disk size (GB)"     CT_VPN_DISK "6"
   ask "RAM (MB)"           CT_VPN_RAM  "512"
@@ -222,7 +230,9 @@ else
   echo -e "  ${BOLD}Container B — Web Panel${NC}"
   DEF_CTB=$(next_free_ctid $((CT_VPN_ID+1)))
   ask "Container ID"       CT_PANEL_ID   "$DEF_CTB"
-  pct status "$CT_PANEL_ID" &>/dev/null 2>&1 && error "Container $CT_PANEL_ID already exists"
+  if pct status "$CT_PANEL_ID" &>/dev/null 2>&1; then
+    error "Container $CT_PANEL_ID already exists"
+  fi
   ask "Hostname"           CT_PANEL_HOST "openvpn-panel"
   ask "Disk size (GB)"     CT_PANEL_DISK "8"
   ask "RAM (MB)"           CT_PANEL_RAM  "1024"
