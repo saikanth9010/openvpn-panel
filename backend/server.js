@@ -201,32 +201,73 @@ app.post("/api/generate", auth("admin", "operator"), async (req, res) => {
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name))
     return res.status(400).json({ error: "Invalid name. Use letters, numbers, _ and - only." });
 
+  console.log(`[generate] Starting for: ${name}, cipher: ${cipher}`);
+
   try {
-    // Generate cert
-    const genCmd = usePass
-      ? `cd "${EASY_RSA}" && echo -e "${passphrase}\\n${passphrase}" | ./easyrsa gen-req "${name}" && echo yes | ./easyrsa sign-req client "${name}"`
-      : `cd "${EASY_RSA}" && ./easyrsa gen-req "${name}" nopass && echo yes | ./easyrsa sign-req client "${name}"`;
+    // Do everything in ONE SSH connection / ONE execSync call to avoid multiple round trips
+    const bigCmd = `
+set -e
+cd "${EASY_RSA}"
+export EASYRSA_BATCH=1
+# Generate client cert (skip if already exists)
+if [ ! -f "pki/issued/${name}.crt" ]; then
+  ./easyrsa gen-req "${name}" nopass 2>/dev/null
+  ./easyrsa sign-req client "${name}" 2>/dev/null
+fi
+# Output all files separated by markers
+echo "===CA==="
+cat pki/ca.crt
+echo "===CERT==="
+cat "pki/issued/${name}.crt"
+echo "===KEY==="
+cat "pki/private/${name}.key"
+echo "===TA==="
+cat pki/ta.key 2>/dev/null || echo ""
+echo "===DONE==="
+`;
 
-    await runCmd(genCmd);
+    console.log(`[generate] Running command on ${IS_SINGLE ? "local" : VPN_HOST}...`);
+    const output = await runCmd(bigCmd);
+    console.log(`[generate] Command finished, parsing output...`);
 
-    // Read certs
-    const ca   = await runCmd(`cat "${EASY_RSA}/pki/ca.crt"`);
-    const cert = await runCmd(`cat "${EASY_RSA}/pki/issued/${name}.crt"`);
-    const key  = await runCmd(`cat "${EASY_RSA}/pki/private/${name}.key"`);
-    const ta   = await runCmd(`cat "${EASY_RSA}/pki/ta.key" 2>/dev/null || cat /etc/openvpn/ta.key 2>/dev/null || echo ""`);
+    // Parse the output by markers
+    const section = (marker) => {
+      const start = output.indexOf(`===${marker}===`);
+      const markers = ["===CA===","===CERT===","===KEY===","===TA===","===DONE==="];
+      const nextIdx = markers.findIndex(m => m === `===${marker}===`) + 1;
+      const end   = nextIdx < markers.length ? output.indexOf(markers[nextIdx]) : output.length;
+      return start === -1 ? "" : output.slice(start + marker.length + 6, end).trim();
+    };
 
-    const ovpn = buildOvpn({ name, cipher, usePass, ca, cert, key, ta });
+    const ca   = section("CA");
+    const cert = section("CERT");
+    const key  = section("KEY");
+    const ta   = section("TA");
+
+    if (!ca || !cert || !key) {
+      console.error("[generate] Missing cert data:", { ca: !!ca, cert: !!cert, key: !!key });
+      return res.status(500).json({ error: "Cert generation failed — missing output" });
+    }
+
+    // Extract only the client cert (last cert block, skip CA chain)
+    const certBlocks = cert.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) || [];
+    const certBlock  = certBlocks[certBlocks.length - 1] || cert;
+
+    const ovpn = buildOvpn({ name, cipher, usePass, ca, cert: certBlock, key, ta });
 
     const profiles = loadProfiles();
-    profiles.unshift({ name, cipher, pass: !!usePass, created: new Date().toISOString().slice(0, 10), createdBy: req.user.username });
-    saveProfiles(profiles);
+    if (!profiles.find(p => p.name === name)) {
+      profiles.unshift({ name, cipher, pass: !!usePass, created: new Date().toISOString().slice(0,10), createdBy: req.user.username });
+      saveProfiles(profiles);
+    }
 
+    console.log(`[generate] Success — sending ${ovpn.length} byte .ovpn file`);
     res.setHeader("Content-Disposition", `attachment; filename="${name}.ovpn"`);
     res.setHeader("Content-Type", "application/x-openvpn-profile");
     res.send(ovpn);
   } catch (err) {
-    console.error("Generate error:", err.message);
-    res.status(500).json({ error: "Failed to generate profile: " + err.message });
+    console.error("[generate] Error:", err.message);
+    res.status(500).json({ error: "Failed to generate: " + err.message });
   }
 });
 
@@ -292,7 +333,7 @@ app.get("/api/profiles/:name/download", auth("admin", "operator"), async (req, r
 
 app.delete("/api/profiles/:name", auth("admin"), async (req, res) => {
   saveProfiles(loadProfiles().filter(p => p.name !== req.params.name));
-  try { await runCmd(`cd "${EASY_RSA}" && echo yes | ./easyrsa revoke "${req.params.name}" && ./easyrsa gen-crl`); } catch {}
+  try { await runCmd(`cd "${EASY_RSA}" && EASYRSA_BATCH=1 ./easyrsa revoke "${req.params.name}" ; EASYRSA_BATCH=1 ./easyrsa gen-crl`); } catch {}
   res.json({ ok: true });
 });
 
